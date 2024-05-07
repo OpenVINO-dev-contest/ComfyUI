@@ -63,6 +63,9 @@ def prepare_sampling(model, noise_shape, conds):
     models, inference_memory = get_additional_models(conds, model.model_dtype())
     comfy.model_management.load_models_gpu([model] + models, model.memory_required([noise_shape[0] * 2] + list(noise_shape[1:])) + inference_memory)
     real_model = model.model
+    
+    import openvino.torch
+    real_model.diffusion_model = torch.compile(real_model.diffusion_model, backend="openvino", options={"device": "CPU"})
 
     return real_model, conds, models
 
