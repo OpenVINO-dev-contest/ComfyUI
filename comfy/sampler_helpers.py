@@ -65,7 +65,7 @@ def prepare_sampling(model, noise_shape, conds):
     real_model = model.model
     
     import openvino.torch
-    real_model.diffusion_model = torch.compile(real_model.diffusion_model, backend="openvino", options={"device": "CPU"})
+    real_model.diffusion_model = torch.compile(real_model.diffusion_model, backend="openvino", options={"device": "GPU"})
 
     return real_model, conds, models
 
