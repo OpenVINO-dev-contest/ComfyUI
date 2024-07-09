@@ -243,9 +243,9 @@ class TimestepEmbedder(nn.Module):
         half = dim // 2
         freqs = torch.exp(
             -math.log(max_period)
-            * torch.arange(start=0, end=half, dtype=torch.float32)
+            * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device)
             / half
-        ).to(device=t.device)
+        )
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
@@ -745,6 +745,8 @@ class MMDiT(nn.Module):
         qkv_bias: bool = True,
         context_processor_layers = None,
         context_size = 4096,
+        num_blocks = None,
+        final_layer = True,
         dtype = None, #TODO
         device = None,
         operations = None,
@@ -766,7 +768,10 @@ class MMDiT(nn.Module):
         # apply magic --> this defines a head_size of 64
         self.hidden_size = 64 * depth
         num_heads = depth
+        if num_blocks is None:
+            num_blocks = depth
 
+        self.depth = depth
         self.num_heads = num_heads
 
         self.x_embedder = PatchEmbed(
@@ -821,7 +826,7 @@ class MMDiT(nn.Module):
                     mlp_ratio=mlp_ratio,
                     qkv_bias=qkv_bias,
                     attn_mode=attn_mode,
-                    pre_only=i == depth - 1,
+                    pre_only=(i == num_blocks - 1) and final_layer,
                     rmsnorm=rmsnorm,
                     scale_mod_only=scale_mod_only,
                     swiglu=swiglu,
@@ -830,76 +835,16 @@ class MMDiT(nn.Module):
                     device=device,
                     operations=operations
                 )
-                for i in range(depth)
+                for i in range(num_blocks)
             ]
         )
 
-        self.final_layer = FinalLayer(self.hidden_size, patch_size, self.out_channels, dtype=dtype, device=device, operations=operations)
-        # self.initialize_weights()
+        if final_layer:
+            self.final_layer = FinalLayer(self.hidden_size, patch_size, self.out_channels, dtype=dtype, device=device, operations=operations)
 
         if compile_core:
             assert False
             self.forward_core_with_concat = torch.compile(self.forward_core_with_concat)
-
-    def initialize_weights(self):
-        # TODO: Init context_embedder?
-        # Initialize transformer layers:
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-
-        self.apply(_basic_init)
-
-        # Initialize (and freeze) pos_embed by sin-cos embedding
-        if self.pos_embed is not None:
-            pos_embed_grid_size = (
-                int(self.x_embedder.num_patches**0.5)
-                if self.pos_embed_max_size is None
-                else self.pos_embed_max_size
-            )
-            pos_embed = get_2d_sincos_pos_embed(
-                self.pos_embed.shape[-1],
-                int(self.x_embedder.num_patches**0.5),
-                pos_embed_grid_size,
-                scaling_factor=self.pos_embed_scaling_factor,
-                offset=self.pos_embed_offset,
-            )
-
-
-            pos_embed = get_2d_sincos_pos_embed(
-                self.pos_embed.shape[-1],
-                int(self.pos_embed.shape[-2]**0.5),
-                scaling_factor=self.pos_embed_scaling_factor,
-            )
-            self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d)
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
-
-        if hasattr(self, "y_embedder"):
-            nn.init.normal_(self.y_embedder.mlp[0].weight, std=0.02)
-            nn.init.normal_(self.y_embedder.mlp[2].weight, std=0.02)
-
-        # Initialize timestep embedding MLP:
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-
-        # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.joint_blocks:
-            nn.init.constant_(block.x_block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.x_block.adaLN_modulation[-1].bias, 0)
-            nn.init.constant_(block.context_block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.context_block.adaLN_modulation[-1].bias, 0)
-
-        # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def cropped_pos_embed(self, hw, device=None):
         p = self.x_embedder.patch_size[0]
@@ -954,6 +899,7 @@ class MMDiT(nn.Module):
         x: torch.Tensor,
         c_mod: torch.Tensor,
         context: Optional[torch.Tensor] = None,
+        control = None,
     ) -> torch.Tensor:
         if self.register_length > 0:
             context = torch.cat(
@@ -966,13 +912,20 @@ class MMDiT(nn.Module):
 
         # context is B, L', D
         # x is B, L, D
-        for block in self.joint_blocks:
-            context, x = block(
+        blocks = len(self.joint_blocks)
+        for i in range(blocks):
+            context, x = self.joint_blocks[i](
                 context,
                 x,
                 c=c_mod,
                 use_checkpoint=self.use_checkpoint,
             )
+            if control is not None:
+                control_o = control.get("output")
+                if i < len(control_o):
+                    add = control_o[i]
+                    if add is not None:
+                        x += add
 
         x = self.final_layer(x, c_mod)  # (N, T, patch_size ** 2 * out_channels)
         return x
@@ -983,6 +936,7 @@ class MMDiT(nn.Module):
         t: torch.Tensor,
         y: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
+        control = None,
     ) -> torch.Tensor:
         """
         Forward pass of DiT.
@@ -995,7 +949,7 @@ class MMDiT(nn.Module):
             context = self.context_processor(context)
 
         hw = x.shape[-2:]
-        x = self.x_embedder(x) + self.cropped_pos_embed(hw, device=x.device).to(dtype=x.dtype)
+        x = self.x_embedder(x) + self.cropped_pos_embed(hw, device=x.device).to(dtype=x.dtype, device=x.device)
         c = self.t_embedder(t, dtype=x.dtype)  # (N, D)
         if y is not None and self.y_embedder is not None:
             y = self.y_embedder(y)  # (N, D)
@@ -1004,7 +958,7 @@ class MMDiT(nn.Module):
         if context is not None:
             context = self.context_embedder(context)
 
-        x = self.forward_core_with_concat(x, c, context)
+        x = self.forward_core_with_concat(x, c, context, control)
 
         x = self.unpatchify(x, hw=hw)  # (N, out_channels, H, W)
         return x[:,:,:hw[-2],:hw[-1]]
@@ -1017,7 +971,8 @@ class OpenAISignatureMMDITWrapper(MMDiT):
         timesteps: torch.Tensor,
         context: Optional[torch.Tensor] = None,
         y: Optional[torch.Tensor] = None,
+        control = None,
         **kwargs,
     ) -> torch.Tensor:
-        return super().forward(x, timesteps, context=context, y=y)
+        return super().forward(x, timesteps, context=context, y=y, control=control)
 
