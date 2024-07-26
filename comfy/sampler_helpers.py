@@ -64,8 +64,9 @@ def prepare_sampling(model, noise_shape, conds):
     comfy.model_management.load_models_gpu([model] + models, model.memory_required([noise_shape[0] * 2] + list(noise_shape[1:])) + inference_memory)
     real_model = model.model
     
-    if str(type(real_model.diffusion_model))=="<class 'comfy.ldm.modules.diffusionmodules.openaimodel.UNetModel'>":
+    if real_model.diffusion_model.__class__.__name__=="UNetModel":
         import openvino.torch
+        print("unet compiling")
         real_model.diffusion_model = torch.compile(real_model.diffusion_model, backend="openvino", options = {"device" : "GPU", "model_caching" : False, "cache_dir": "./model_cache", "config": {"GPU_ENABLE_SDPA_OPTIMIZATION": "NO"}})
 
     return real_model, conds, models
